@@ -182,6 +182,7 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
      */
     static void requestHotReload(String packageName) {
         for (var processInfo : processes.values()) {
+            if (processInfo.heartBeat == null) continue;
             var optedIn = false;
             for (var module : modulesForProcess(processInfo)) {
                 if (packageName.equals(module.packageName)) {

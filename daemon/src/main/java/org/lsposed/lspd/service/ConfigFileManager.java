@@ -436,24 +436,23 @@ public class ConfigFileManager {
         if (apkFile.getEntry("META-INF/xposed/java_init.list") == null) return null;
         var properties = readModuleProperties(apkFile);
         if (properties == null) return null;
-        int minApiVersion = readApiVersion(properties, "minApiVersion");
-        int targetApiVersion = readApiVersion(properties, "targetApiVersion");
-        // Only what the module demands of us decides, and that is its floor. The libxposed API is
-        // cumulative, so a framework implementing 102 loads a module built against 101 just as
-        // well; comparing targetApiVersion against our own version would retire every module on
-        // the device the moment LIB_API moves.
-        if (minApiVersion > LSPModuleService.XPOSED_API_VERSION) return null;
-        if (targetApiVersion > LSPModuleService.XPOSED_API_VERSION) return null;
+        // minApiVersion is the module's own floor, the oldest API it is written to run on, and it
+        // is the only thing that decides whether we can load it. targetApiVersion is what the
+        // module was built against and says nothing about what it accepts: "minApiVersion=101,
+        // targetApiVersion=102" is a module that guards its 102 calls at runtime and runs fine on
+        // 101. Comparing either against our own version retires modules the moment LIB_API moves.
+        if (readApiVersion(properties, "minApiVersion") > LSPModuleService.XPOSED_API_VERSION) return null;
         return properties;
     }
 
+    /**
+     * Whether an APK is a libxposed module this framework is too old to load, which is a different
+     * answer from "not a module at all": such an APK must not fall through to the legacy path.
+     */
     static boolean requiresModernModuleLoading(ZipFile apkFile) {
         var properties = readModuleProperties(apkFile);
         if (properties == null) return false;
-        int minApiVersion = readApiVersion(properties, "minApiVersion");
-        int targetApiVersion = readApiVersion(properties, "targetApiVersion");
-        return minApiVersion > LSPModuleService.XPOSED_API_VERSION
-                || targetApiVersion > LSPModuleService.XPOSED_API_VERSION;
+        return readApiVersion(properties, "minApiVersion") > LSPModuleService.XPOSED_API_VERSION;
     }
 
     private static boolean isExceptionPassthrough(Properties properties) {

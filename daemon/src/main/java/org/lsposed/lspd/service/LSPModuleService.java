@@ -58,6 +58,18 @@ public class LSPModuleService extends IXposedService.Stub {
     // higher minApiVersion are rejected at load time (see ConfigFileManager#loadModule).
     static final int XPOSED_API_VERSION = XposedInterface.LIB_API;
 
+    /**
+     * The libxposed <b>service</b> API this framework implements, which is what a module app is
+     * told through {@link IXposedService#getAPIVersion()}.
+     *
+     * <p>The service surface is the one a module app talks to, and it lives in the libxposed/service
+     * submodule. That submodule has not moved past API 101 here, so this framework cannot claim the
+     * 102 members such an app would reach for next - the running-target list, the reload request.
+     * Raise this together with the submodule and no earlier: reporting a level the service does not
+     * implement turns those calls into NoSuchMethodError inside a module app.</p>
+     */
+    static final int SERVICE_API_VERSION = XposedInterface.API_101;
+
     private final static String TAG = "LSPosedModuleService";
 
     private final static Set<Integer> uidSet = ConcurrentHashMap.newKeySet();
@@ -297,7 +309,7 @@ public class LSPModuleService extends IXposedService.Stub {
     @Override
     public int getAPIVersion() throws RemoteException {
         ensureModule();
-        return XPOSED_API_VERSION;
+        return SERVICE_API_VERSION;
     }
 
     @Override

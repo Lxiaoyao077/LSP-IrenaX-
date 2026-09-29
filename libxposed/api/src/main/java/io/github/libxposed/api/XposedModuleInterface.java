@@ -240,8 +240,6 @@ public interface XposedModuleInterface {
      * @param param Information about the reload
      */
     default void onHotReloaded(@NonNull HotReloadedParam param) {
-        for (var handle : param.getOldHookHandles()) {
-            handle.unhook();
-        }
+        param.getOldHookHandles().forEach(XposedInterface.HookHandle::unhook);
     }
 }
