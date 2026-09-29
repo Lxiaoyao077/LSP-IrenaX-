@@ -44,12 +44,6 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
     final static int DEX_TRANSACTION_CODE = 1310096052;
     final static int OBFUSCATION_MAP_TRANSACTION_CODE = 724533732;
 
-    /**
-     * The code the injected process recognises as a hot reload request (API 102) in
-     * {@code org.lsposed.lspd.service.BridgeService.execTransact}.
-     */
-    final static int HOT_RELOAD_TRANSACTION_CODE = ('_' << 24) | ('H' << 16) | ('R' << 8) | 'L';
-
     // key: <uid, pid>
     private final static Map<Pair<Integer, Integer>, ProcessInfo> processes = new ConcurrentHashMap<>();
 
@@ -58,6 +52,42 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
         final int pid;
         final String processName;
         final IBinder heartBeat;
+
+        /**
+         * Hot reload bookkeeping per module package name (API 102).
+         *
+         * <p>The daemon is the only side that can keep this: it knows which build it handed the
+         * process and which build it later asked it to load, while the process only ever knows the
+         * code it is executing.</p>
+         */
+        final Map<String, Target> targets = new ConcurrentHashMap<>();
+
+        static final class Target {
+            /**
+             * The build of the module this process was last handed, i.e. what it is running.
+             *
+             * <p>Recorded when the module list is served, which is what the process is about to
+             * load; a build it then fails to load is corrected by the reload it reports.</p>
+             */
+            volatile String delivered;
+            /** The build the daemon last asked this process to load, so one build is asked once. */
+            volatile String requested;
+            /** Last reported outcome, one of the {@code ILSPApplicationService.HOT_RELOAD_*} values. */
+            volatile int status = ILSPApplicationService.HOT_RELOAD_IN_PROGRESS;
+            volatile String message;
+
+            boolean runs(String build) {
+                return build != null && build.equals(delivered);
+            }
+
+            boolean askedFor(String build) {
+                return build != null && build.equals(requested);
+            }
+        }
+
+        Target target(String packageName) {
+            return targets.computeIfAbsent(packageName, k -> new Target());
+        }
 
         ProcessInfo(int uid, int pid, String processName, IBinder heartBeat) throws RemoteException {
             this.uid = uid;
@@ -124,14 +154,28 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
         }
     }
 
-    private List<Module> getAllModulesList() throws RemoteException {
-        var processInfo = ensureRegistered();
+    private List<Module> allModulesList(ProcessInfo processInfo) throws RemoteException {
         if (processInfo.uid == Process.SYSTEM_UID && processInfo.processName.equals("system")) {
             return ConfigManager.getInstance().getModulesForSystemServer();
         }
         if (ServiceManager.getManagerService().isRunningManager(processInfo.pid, processInfo.uid))
             return Collections.emptyList();
         return ConfigManager.getInstance().getModulesForProcess(processInfo.processName, processInfo.uid);
+    }
+
+    private List<Module> getAllModulesList() throws RemoteException {
+        var processInfo = ensureRegistered();
+        var modules = allModulesList(processInfo);
+        for (var module : modules) {
+            // Serving the list is the moment the daemon hands over a build, and the closest it can
+            // get to knowing what this process runs. On the next update that build is compared
+            // against the one on disk, which is how processes that still need a reload - or a
+            // restart, when the module never opted into reloading - are told apart from the ones
+            // that are already current.
+            processInfo.target(module.packageName).delivered =
+                    ConfigManager.getInstance().getModuleBuild(module.packageName);
+        }
+        return modules;
     }
 
     @Override
@@ -170,6 +214,21 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
     }
 
     /**
+     * What one pass of {@link #requestHotReload} found.
+     */
+    static final class HotReloadDispatch {
+        /** Processes that were asked to load the new build. */
+        int asked;
+        /** Processes still running an older build than the one on disk, asked or not. */
+        int stale;
+
+        @Override
+        public String toString() {
+            return "asked=" + asked + ", stale=" + stale;
+        }
+    }
+
+    /**
      * Asks every process that has {@code packageName} in scope to reload it (API 102).
      *
      * <p>A module is one package and one binary for the whole device, so replacing it has to reach
@@ -178,19 +237,88 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
      *
      * <p>An update is only offered to a module that declared {@code autoHotReload}: a reload
      * retires the generation in place, and a module that never asked for it is one that has not
-     * been written to be retired.</p>
+     * been written to be retired. A process is asked about a given build at most once, so the
+     * several broadcasts one install produces cannot reload it several times, and a refusal is not
+     * retried until the code changes.</p>
+     *
+     * @return the pass's tally; {@link HotReloadDispatch#stale} is non-zero for a module that did
+     * not opt in, which is the case a restart is the only way out of
      */
-    static void requestHotReload(String packageName) {
+    static HotReloadDispatch requestHotReload(String packageName) {
+        var dispatch = new HotReloadDispatch();
+        var module = ConfigManager.getInstance().getModuleByPackage(packageName);
+        var build = ConfigManager.getInstance().getModuleBuild(packageName);
+        var optedIn = module != null && module.file != null && module.file.autoHotReload;
+
         for (var processInfo : processes.values()) {
             if (processInfo.heartBeat == null) continue;
-            var optedIn = false;
-            for (var module : modulesForProcess(processInfo)) {
-                if (packageName.equals(module.packageName)) {
-                    optedIn = module.file != null && module.file.autoHotReload;
+            var inScope = false;
+            for (var scoped : modulesForProcess(processInfo)) {
+                if (packageName.equals(scoped.packageName)) {
+                    inScope = true;
                     break;
                 }
             }
-            if (optedIn) dispatchHotReload(processInfo, packageName);
+            if (!inScope) continue;
+
+            var target = processInfo.target(packageName);
+            if (!target.runs(build)) dispatch.stale++;
+            if (!optedIn) continue;
+
+            if (target.askedFor(build)) {
+                Log.d(TAG, processInfo.processName + " was already asked for " + packageName
+                        + ", last outcome: " + describe(target));
+                continue;
+            }
+            target.requested = build;
+            target.status = ILSPApplicationService.HOT_RELOAD_IN_PROGRESS;
+            target.message = null;
+            dispatch.asked++;
+            dispatchHotReload(processInfo, packageName);
+        }
+        return dispatch;
+    }
+
+    /**
+     * The outcome of a reload the daemon asked a process for (API 102).
+     *
+     * <p>The request is oneway, so this is the only way the daemon learns that a module refused, or
+     * that the swap threw and the process is still running the build it started with. Until this
+     * arrives the reload is assumed to be in progress; a process that dies first takes its entry in
+     * {@code processes} with it, so nothing is left pending.</p>
+     */
+    @Override
+    public void reportHotReloadResult(String packageName, int status, String message) {
+        final ProcessInfo processInfo;
+        try {
+            processInfo = ensureRegistered();
+        } catch (RemoteException e) {
+            Log.w(TAG, "Hot reload result from an unregistered process: " + e.getMessage());
+            return;
+        }
+        var target = processInfo.target(packageName);
+        target.status = status;
+        target.message = message;
+        if (status != ILSPApplicationService.HOT_RELOAD_SUCCEEDED) {
+            // Nothing here knows what the process is running any more, and treating it as current
+            // would hide exactly the state a restart is meant to fix.
+            target.delivered = null;
+        }
+        Log.i(TAG, processInfo.processName + " hot reload of " + packageName + ": " + describe(target));
+    }
+
+    private static String describe(ProcessInfo.Target target) {
+        switch (target.status) {
+            case ILSPApplicationService.HOT_RELOAD_SUCCEEDED:
+                return "succeeded";
+            case ILSPApplicationService.HOT_RELOAD_REFUSED:
+                return "refused by the module";
+            case ILSPApplicationService.HOT_RELOAD_NOT_LOADED:
+                return "not loaded here";
+            case ILSPApplicationService.HOT_RELOAD_FAILED:
+                return target.message == null ? "failed" : "failed: " + target.message;
+            default:
+                return "in progress";
         }
     }
 
@@ -206,19 +334,10 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
     }
 
     private static void dispatchHotReload(ProcessInfo processInfo, String packageName) {
-        var data = Parcel.obtain();
-        try {
-            data.writeString(packageName);
-            // Extras are reserved for the service-triggered path, which passes them; a module
-            // update has nothing to hand over.
-            data.writeBundle(null);
-            // Oneway: the callee runs module code, which the daemon has no deadline over, and the
-            // outcome is the process's to log.
-            processInfo.heartBeat.transact(HOT_RELOAD_TRANSACTION_CODE, data, null, IBinder.FLAG_ONEWAY);
-        } catch (RemoteException e) {
-            Log.w(TAG, "Cannot reach " + processInfo.processName + " for a hot reload", e);
-        } finally {
-            data.recycle();
+        // Extras are reserved for the service-triggered path, which passes them; a module update
+        // has nothing to hand over.
+        if (!BridgeService.requestHotReload(processInfo.heartBeat, packageName, null)) {
+            Log.w(TAG, "Cannot reach " + processInfo.processName + " for a hot reload");
         }
     }
 

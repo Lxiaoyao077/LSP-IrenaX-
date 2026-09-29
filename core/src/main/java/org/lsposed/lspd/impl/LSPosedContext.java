@@ -21,6 +21,7 @@ import org.lsposed.lspd.impl.utils.LSPosedDexParser;
 import org.lsposed.lspd.models.Module;
 import org.lsposed.lspd.nativebridge.HookBridge;
 import org.lsposed.lspd.nativebridge.NativeAPI;
+import org.lsposed.lspd.service.ILSPApplicationService;
 import org.lsposed.lspd.service.ILSPInjectedModuleService;
 import org.lsposed.lspd.util.LspModuleClassLoader;
 
@@ -37,11 +38,11 @@ import java.nio.ByteBuffer;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.UnknownHostException;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Consumer;
 
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
@@ -58,8 +59,6 @@ public class LSPosedContext implements XposedInterface {
     public static boolean isSystemServer;
     public static String appDir;
     public static String processName;
-
-    static final Set<XposedModule> modules = ConcurrentHashMap.newKeySet();
 
     private final String mPackageName;
     private final ApplicationInfo mApplicationInfo;
@@ -102,73 +101,87 @@ public class LSPosedContext implements XposedInterface {
     }
 
     // module lifecycle dispatch: fire every callback, modules react to what they override.
+    //
+    // Dispatch walks the live generations, so which entries a callback reaches is decided by the
+    // single map entry a reload writes. Subscribing a generation as it is built instead would let a
+    // call observe a module twice - or, if the build threw halfway, permanently, because the
+    // half-built generation has no name to be retired under.
+
+    private static void forEachEntry(Consumer<XposedModule> action) {
+        for (var generation : generations.values()) {
+            for (var module : generation.entries) {
+                action.accept(module);
+            }
+        }
+    }
 
     public static void callOnModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
-        for (XposedModule module : modules) {
+        forEachEntry(module -> {
             try {
                 module.onModuleLoaded(param);
             } catch (Throwable t) {
                 Log.e(TAG, "Error when calling onModuleLoaded of " + module.getModuleApplicationInfo().packageName, t);
             }
-        }
+        });
     }
 
     public static void callOnPackageLoaded(XposedModuleInterface.PackageLoadedParam param) {
-        for (XposedModule module : modules) {
+        forEachEntry(module -> {
             try {
                 module.onPackageLoaded(param);
             } catch (Throwable t) {
                 Log.e(TAG, "Error when calling onPackageLoaded of " + module.getModuleApplicationInfo().packageName, t);
             }
-        }
+        });
     }
 
     public static void callOnPackageReady(XposedModuleInterface.PackageReadyParam param) {
-        for (XposedModule module : modules) {
+        forEachEntry(module -> {
             try {
                 module.onPackageReady(param);
             } catch (Throwable t) {
                 Log.e(TAG, "Error when calling onPackageReady of " + module.getModuleApplicationInfo().packageName, t);
             }
-        }
+        });
     }
 
     public static void callOnSystemServerLoaded(XposedModuleInterface.SystemServerLoadedParam param) {
-        for (XposedModule module : modules) {
+        forEachEntry(module -> {
             try {
                 module.onSystemServerLoaded(param);
             } catch (Throwable t) {
                 Log.e(TAG, "Error when calling onSystemServerLoaded of " + module.getModuleApplicationInfo().packageName, t);
             }
-        }
+        });
     }
 
     public static void callOnSystemServerStarting(XposedModuleInterface.SystemServerStartingParam param) {
-        for (XposedModule module : modules) {
+        forEachEntry(module -> {
             try {
                 module.onSystemServerStarting(param);
             } catch (Throwable t) {
                 Log.e(TAG, "Error when calling onSystemServerStarting of " + module.getModuleApplicationInfo().packageName, t);
             }
-        }
+        });
     }
 
     /**
      * The entry classes of one module package as they are currently loaded, together with the
      * framework interface they were attached to.
      *
-     * <p>A reload replaces this whole object. The new generation is built next to the old one and
-     * only then takes its place, so no call ever sees the module half rebuilt.</p>
+     * <p>A reload replaces this whole object, and publishing it is a single write to the map the
+     * dispatch above walks: callbacks see the old generation or the new one, never both and never
+     * neither. The entries are a copy-on-write list because an entry can leave the lifecycle on its
+     * own from inside a callback this list is being iterated for.</p>
      */
     private static final class Generation {
         final ClassLoader classLoader;
         final LSPosedContext context;
-        final List<XposedModule> entries;
+        final List<XposedModule> entries = new CopyOnWriteArrayList<>();
 
-        Generation(ClassLoader classLoader, LSPosedContext context, List<XposedModule> entries) {
+        Generation(ClassLoader classLoader, LSPosedContext context) {
             this.classLoader = classLoader;
             this.context = context;
-            this.entries = entries;
         }
     }
 
@@ -205,6 +218,10 @@ public class LSPosedContext implements XposedInterface {
             }
             module.file.moduleLibraryNames.forEach(NativeAPI::recordNativeEntrypoint);
             var generation = instantiate(module, mcl, true);
+            if (generation.entries.isEmpty()) {
+                Log.e(TAG, "  No entry class of " + module.packageName + " could be loaded");
+                return false;
+            }
             generations.put(module.packageName, generation);
             Log.d(TAG, "Loaded module " + module.packageName + ": " + generation.context);
         } catch (Throwable e) {
@@ -239,6 +256,10 @@ public class LSPosedContext implements XposedInterface {
     /**
      * Builds a generation from a module's already-loaded code.
      *
+     * <p>Nothing is published here: the entries are collected into the generation and only reach
+     * the process when the caller puts it in the map. A build that throws part way through, or one
+     * whose entries all fail to load, therefore leaves the process exactly as it was.</p>
+     *
      * @param firstLoad whether this is the initial load, which is the only time
      *                  {@link XposedModuleInterface#onModuleLoaded} is delivered: the interface
      *                  says a reload does not replay it, so new code hears about the swap through
@@ -247,25 +268,30 @@ public class LSPosedContext implements XposedInterface {
     private static Generation instantiate(Module module, ClassLoader mcl, boolean firstLoad) {
         var defaultExceptionMode = module.file.exceptionPassthrough ? ExceptionMode.PASSTHROUGH : ExceptionMode.PROTECTIVE;
         var ctx = new LSPosedContext(module.packageName, module.applicationInfo, module.service, defaultExceptionMode);
-        var entries = new ArrayList<XposedModule>();
+        var generation = new Generation(mcl, ctx);
         for (var entry : module.file.moduleClassNames) {
-            var moduleClass = mcl.loadClass(entry);
-            Log.d(TAG, "  Loading class " + moduleClass);
-            if (!XposedModule.class.isAssignableFrom(moduleClass)) {
-                Log.e(TAG, "    This class doesn't implement any sub-interface of XposedModule, skipping it");
-                continue;
-            }
             try {
-                entries.add(instantiateEntry(moduleClass, ctx, firstLoad));
+                var moduleClass = mcl.loadClass(entry);
+                Log.d(TAG, "  Loading class " + moduleClass);
+                if (!XposedModule.class.isAssignableFrom(moduleClass)) {
+                    Log.e(TAG, "    This class doesn't implement any sub-interface of XposedModule, skipping it");
+                    continue;
+                }
+                var moduleContext = instantiateEntry(moduleClass, ctx, generation.entries);
+                if (firstLoad) {
+                    moduleContext.onModuleLoaded(new ModuleLoadedParamImpl());
+                }
             } catch (Throwable e) {
-                Log.e(TAG, "    Failed to load class " + moduleClass, e);
+                // One broken entry must not cost the module the others; an update that renames a
+                // class is exactly the case a reload has to survive.
+                Log.e(TAG, "    Failed to load class " + entry, e);
             }
         }
-        return new Generation(mcl, ctx, entries);
+        return generation;
     }
 
-    private static XposedModule instantiateEntry(Class<?> moduleClass, LSPosedContext ctx, boolean firstLoad)
-            throws Throwable {
+    private static XposedModule instantiateEntry(Class<?> moduleClass, LSPosedContext ctx,
+                                                 List<XposedModule> entries) throws Throwable {
         XposedModule moduleContext;
         try {
             // API 100 modules take a (XposedInterface, ModuleLoadedParam) ctor, API 101 and 102
@@ -279,21 +305,10 @@ public class LSPosedContext implements XposedInterface {
             // From 102 an entry can leave the lifecycle on its own, and only for itself: the
             // framework holds the reference, so it is the one that has to be able to drop it,
             // while a sibling entry of the same module keeps receiving its callbacks.
-            entry.attachFramework(ctx, () -> modules.remove(entry));
+            entry.attachFramework(ctx, () -> entries.remove(entry));
             moduleContext = entry;
         }
-        modules.add(moduleContext);
-        // An entry that detached from its own constructor never asked for callbacks at all.
-        if (firstLoad && modules.contains(moduleContext)) {
-            try {
-                moduleContext.onModuleLoaded(new ModuleLoadedParamImpl());
-            } catch (Throwable t) {
-                // It is still subscribed, and it is not going to be part of any generation, so
-                // nothing would ever take it out again.
-                modules.remove(moduleContext);
-                throw t;
-            }
-        }
+        entries.add(moduleContext);
         return moduleContext;
     }
 
@@ -303,53 +318,65 @@ public class LSPosedContext implements XposedInterface {
      * <p>The old generation is asked first and nothing is disturbed until it agrees. Then its hook
      * registration is closed and its installed hooks are collected, and only after that is the new
      * generation built from the module's current APK - by which point the daemon has already
-     * re-read it. The two generations are never both able to answer a call: the swap happens once
-     * the new one is complete, and the handles the old one left are handed to the new code to
-     * retire or take over.</p>
+     * re-read it. The two generations are never both able to answer a call: the swap is one write
+     * to the generation map, and the handles the old one left are handed to the new code to retire
+     * or take over.</p>
      *
      * <p>Reloads are serialised per module, so two updates arriving together cannot both freeze the
-     * same generation and then race to replace it.</p>
+     * same generation and then race to replace it. A request that arrives while another is running
+     * waits its turn rather than being answered from a half-retired generation.</p>
+     *
+     * <p>The outcome is reported to the daemon either way: the request that reaches this process is
+     * oneway, so the process is the only side that can say whether the new code actually took
+     * over.</p>
      *
      * @param packageName the module to reload
      * @param extras      what the caller passed along, or {@code null}
      * @return whether the module was reloaded
      */
     public static boolean requestHotReload(String packageName, Bundle extras) {
-        synchronized (reloadLocks.computeIfAbsent(packageName, k -> new Object())) {
-            return reloadLocked(packageName, extras);
+        var status = ILSPApplicationService.HOT_RELOAD_FAILED;
+        String message = null;
+        try {
+            synchronized (reloadLocks.computeIfAbsent(packageName, k -> new Object())) {
+                status = reloadLocked(packageName, extras);
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to hot reload " + packageName, t);
+            message = String.valueOf(t);
         }
+        reportHotReload(packageName, status, message);
+        return status == ILSPApplicationService.HOT_RELOAD_SUCCEEDED;
     }
 
-    private static boolean reloadLocked(String packageName, Bundle extras) {
+    /** @return one of the {@code ILSPApplicationService.HOT_RELOAD_*} outcomes */
+    private static int reloadLocked(String packageName, Bundle extras) {
         var previous = generations.get(packageName);
         if (previous == null) {
             Log.d(TAG, "Hot reload of " + packageName + " requested, but it is not loaded here");
-            return false;
+            return ILSPApplicationService.HOT_RELOAD_NOT_LOADED;
         }
 
+        // An entry that detached is no longer in the generation, so iterating it is also asking
+        // only the entries that still want to hear about lifecycle events.
         var reloading = new HotReloadingParamImpl(extras, previous.classLoader);
-        var asked = false;
         for (var entry : previous.entries) {
-            // An entry that detached asked to be left out of every lifecycle callback, and being
-            // asked about a reload is one.
-            if (!modules.contains(entry)) continue;
-            asked = true;
             boolean accepted;
             try {
                 accepted = entry.onHotReloading(reloading);
             } catch (Throwable t) {
                 Log.e(TAG, "Error when calling onHotReloading of " + packageName, t);
-                return false;
+                return ILSPApplicationService.HOT_RELOAD_FAILED;
             }
             if (!accepted) {
                 Log.d(TAG, "Hot reload of " + packageName + " refused");
-                return false;
+                return ILSPApplicationService.HOT_RELOAD_REFUSED;
             }
         }
-        if (!asked) {
+        if (previous.entries.isEmpty()) {
             // Nothing is left that could agree, and an unanswered question is not a yes.
             Log.d(TAG, "Hot reload of " + packageName + " has no entry left to ask");
-            return false;
+            return ILSPApplicationService.HOT_RELOAD_NOT_LOADED;
         }
 
         // Close registration before the handle list is read: a hook old code registered from here
@@ -362,23 +389,26 @@ public class LSPosedContext implements XposedInterface {
             var module = findRefreshedModule(packageName);
             if (module == null) {
                 Log.e(TAG, "Hot reload of " + packageName + " found no module to load");
-                return false;
+                return ILSPApplicationService.HOT_RELOAD_NOT_LOADED;
             }
             var mcl = loadModuleApk(module, XposedModule.class.getClassLoader());
-            // The new entries are subscribed as they are built, so an entry that detaches while it
-            // is still being constructed lands here already out of the callback set.
             var next = instantiate(module, mcl, false);
+            if (next.entries.isEmpty()) {
+                // Swapping in a generation with nothing live in it would silently stop the module
+                // from working in this process, which is worse than staying on the old build.
+                Log.e(TAG, "Hot reload of " + packageName + " produced no usable entry; keeping the old build");
+                return ILSPApplicationService.HOT_RELOAD_FAILED;
+            }
             // The library names are re-recorded because an updated module may ship new ones; the
             // old entry points keep working until the process ends.
             module.file.moduleLibraryNames.forEach(NativeAPI::recordNativeEntrypoint);
 
-            modules.removeAll(previous.entries);
+            // The swap: one write, and every callback from here on reaches the new entries only.
             generations.put(packageName, next);
             swapped = true;
 
             var reloaded = new HotReloadedParamImpl(extras, reloading.savedInstanceState, oldHandles);
             for (var entry : next.entries) {
-                if (!modules.contains(entry)) continue;
                 try {
                     entry.onHotReloaded(reloaded);
                 } catch (Throwable t) {
@@ -386,14 +416,28 @@ public class LSPosedContext implements XposedInterface {
                 }
             }
             Log.i(TAG, "Hot reloaded module " + packageName);
-            return true;
+            return ILSPApplicationService.HOT_RELOAD_SUCCEEDED;
         } catch (Throwable t) {
             Log.e(TAG, "Failed to hot reload " + packageName, t);
-            return false;
+            return ILSPApplicationService.HOT_RELOAD_FAILED;
         } finally {
             // A reload that did not go through leaves the old code in charge, so it gets its
             // registration back; a completed one stays retired for good.
             if (!swapped) previous.context.unfreeze();
+        }
+    }
+
+    /**
+     * Tells the daemon how a reload it asked for ended. It cannot find out on its own: the request
+     * is oneway, so without this a refused or failed reload is written down as a success.
+     */
+    private static void reportHotReload(String packageName, int status, String message) {
+        var client = ApplicationServiceClient.serviceClient;
+        if (client == null) return;
+        try {
+            client.reportHotReloadResult(packageName, status, message);
+        } catch (Throwable t) {
+            Log.w(TAG, "Cannot report the reload result of " + packageName, t);
         }
     }
 

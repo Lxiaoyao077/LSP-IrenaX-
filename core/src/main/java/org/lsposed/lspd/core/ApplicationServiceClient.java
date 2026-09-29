@@ -103,6 +103,16 @@ public class ApplicationServiceClient implements ILSPApplicationService, IBinder
     }
 
     @Override
+    public void reportHotReloadResult(String packageName, int status, String message) {
+        try {
+            service.reportHotReloadResult(packageName, status, message);
+        } catch (RemoteException | NullPointerException e) {
+            // The daemon died or never registered this process; there is nowhere left to report to.
+            Utils.logW("cannot report the reload result of " + packageName, e);
+        }
+    }
+
+    @Override
     public IBinder asBinder() {
         return service.asBinder();
     }
