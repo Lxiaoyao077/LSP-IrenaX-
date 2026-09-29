@@ -35,6 +35,15 @@ jobs:
           done
           git submodule status
 
+      - name: Stand in for the private service interface
+        # :libxposed:service takes its sources from the private libxposed/service submodule, and
+        # :daemon extends IXposedService.Stub, so nothing that depends on it can be compiled here
+        # without the interface. Drop the vendored copy into the path the module expects.
+        run: |
+          target=libxposed/service/service/interface/src/main/aidl
+          mkdir -p "$target"
+          cp -r .github/ci-stubs/io "$target/"
+
       - name: Write key
         if: ${{ ( github.event_name != 'pull_request' && github.ref == 'refs/heads/dev' ) || github.ref_type == 'tag' }}
         run: |
@@ -85,10 +94,8 @@ jobs:
           echo 'org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8 -XX:+UseParallelGC' >> ~/.gradle/gradle.properties
           echo 'android.native.buildOutput=verbose' >> ~/.gradle/gradle.properties
 
-      - name: Build the zygisk loader, which also compiles :core's JNI
-        # :daemon needs io.github.libxposed.service.IXposedService, which only the private
-        # libxposed/service submodule provides, so a full build is not possible here. This
-        # target still compiles every Java source that does not need it - :core, :libxposed:api,
-        # :services:daemon-service - plus the native framework through core's CMakeLists.
+      - name: Build the loader, the framework JNI and the daemon
+        # :daemon's only private dependency is the service interface, which the step above
+        # provides, so its sources - reload dispatch included - can be compiled after all.
         run: |
-          ./gradlew :magisk-loader:assembleZygiskDebug --stacktrace
+          ./gradlew :magisk-loader:assembleZygiskDebug :daemon:compileDebugJavaWithJavac --stacktrace
