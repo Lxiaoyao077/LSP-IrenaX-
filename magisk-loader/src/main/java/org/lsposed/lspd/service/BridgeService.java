@@ -26,7 +26,6 @@ import android.app.ActivityThread;
 import android.app.IApplicationThread;
 import android.content.Context;
 import android.os.Binder;
-import android.os.Bundle;
 import android.os.IBinder;
 import android.os.Parcel;
 import android.os.RemoteException;
@@ -35,7 +34,6 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import org.lsposed.lspd.BuildConfig;
-import org.lsposed.lspd.impl.LSPosedContext;
 import org.lsposed.lspd.util.Utils.Log;
 
 public class BridgeService {
@@ -43,23 +41,12 @@ public class BridgeService {
     private static final String DESCRIPTOR = "LSPosed";
     protected static final String TAG = "LSPosed-Bridge";
 
-    // The actions this process accepts. Written out rather than taken from an enum's ordinal: the
-    // daemon and the native side both send these numbers, and a new action appended to an enum
-    // would renumber nothing today and everything later. The native side already writes 2 for
-    // get-binder literally, which is where an ordinal would have gone wrong silently.
-    private static final int ACTION_SEND_BINDER = 1;
-    private static final int ACTION_GET_BINDER = 2;
-    private static final int ACTION_ENABLE_MANAGER = 3;
-
-    /**
-     * A hot reload the daemon asked for (API 102), carrying the module package name and the extras
-     * it passes along.
-     *
-     * <p>It travels on this same protocol rather than on a transaction code of its own because the
-     * native side routes only this code here - a new code would be delivered to the real
-     * {@code Binder.execTransact} and quietly dropped.</p>
-     */
-    private static final int ACTION_HOT_RELOAD = 4;
+    enum ACTION {
+        ACTION_UNKNOWN,
+        ACTION_SEND_BINDER,
+        ACTION_GET_BINDER,
+        ACTION_ENABLE_MANAGER,
+    }
 
     // for client
     private static IBinder serviceBinder = null;
@@ -115,7 +102,7 @@ public class BridgeService {
         if (!ParcelUtils.safeEnforceInterface(data, DESCRIPTOR)) return false;
 
         try {
-            int action = data.readInt();
+            ACTION action = ACTION.values()[data.readInt()];
 
             Log.d(TAG, "onTransact: action=" + action + ", callingUid=" + Binder.getCallingUid() + ", callingPid=" + Binder.getCallingPid());
 
@@ -156,32 +143,6 @@ public class BridgeService {
                         return true;
                     }
                     return false;
-                }
-                case ACTION_HOT_RELOAD: {
-                    // Answered in every case, including the rejected one. The native side takes a
-                    // matched action reported as failed for a broken caller and stops routing this
-                    // whole protocol through the bridge for it, which would cost the process its
-                    // connection to the daemon over a single refused reload.
-                    try {
-                        // Root only: the daemon is the only caller that knows a module's code
-                        // changed on disk, and a module that could ask for its own reload would be
-                        // able to retire the generation the process is running out from under it.
-                        if (Binder.getCallingUid() != 0) {
-                            Log.w(TAG, "Refused a hot reload from uid " + Binder.getCallingUid());
-                        } else {
-                            var packageName = data.readString();
-                            var extras = data.readBundle(BridgeService.class.getClassLoader());
-                            var reloaded = packageName != null
-                                    && LSPosedContext.requestHotReload(packageName, extras);
-                            if (reply != null) {
-                                reply.writeNoException();
-                                reply.writeBoolean(reloaded);
-                            }
-                        }
-                    } catch (Throwable e) {
-                        Log.e(TAG, "hot reload", e);
-                    }
-                    return true;
                 }
             }
         } catch (Throwable e) {

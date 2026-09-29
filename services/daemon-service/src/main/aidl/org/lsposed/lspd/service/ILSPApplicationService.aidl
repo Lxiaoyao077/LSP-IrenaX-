@@ -22,6 +22,23 @@ interface ILSPApplicationService {
      */
     void reportHotReloadResult(String packageName, int status, String message);
 
+    /**
+     * Offers the daemon the binder it can ask this process to reload a module on (API 102).
+     *
+     * <p>A process has to offer one. The heartbeat the daemon already holds is a stock android.os.Binder
+     * the native side creates before the framework dex exists, and the hook that would route
+     * anything else sent to it is installed in system_server alone - so a request aimed at any
+     * other process is dropped, silently.</p>
+     */
+    void registerHotReloadEndpoint(IBinder endpoint);
+
+    /**
+     * The code the endpoint registered through registerHotReloadEndpoint answers to, carrying the
+     * module package name and the extras to pass along. The four bytes are '_HRL', in the shape of
+     * the codes already on this wire.
+     */
+    const int HOT_RELOAD_TRANSACTION_CODE = 1598575180;
+
     const int HOT_RELOAD_IN_PROGRESS = 0;
     const int HOT_RELOAD_SUCCEEDED = 1;
     /** The old generation said no, or there was nothing left in it that could agree. */

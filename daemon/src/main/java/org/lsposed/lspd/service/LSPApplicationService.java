@@ -89,6 +89,12 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
             return targets.computeIfAbsent(packageName, k -> new Target());
         }
 
+        /**
+         * The binder the process offered for reload requests (API 102), or {@code null} while it
+         * has not come up far enough to offer one.
+         */
+        volatile IBinder reloadEndpoint;
+
         ProcessInfo(int uid, int pid, String processName, IBinder heartBeat) throws RemoteException {
             this.uid = uid;
             this.pid = pid;
@@ -265,6 +271,13 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
             if (!target.runs(build)) dispatch.stale++;
             if (!optedIn) continue;
 
+            if (processInfo.reloadEndpoint == null) {
+                // It has the module and it ought to be reloaded, but it never offered a way in, so
+                // it keeps running the build it started with.
+                Log.w(TAG, processInfo.processName + " cannot be asked to reload " + packageName
+                        + " and is left on the build it has");
+                continue;
+            }
             if (target.askedFor(build)) {
                 Log.d(TAG, processInfo.processName + " was already asked for " + packageName
                         + ", last outcome: " + describe(target));
@@ -277,6 +290,24 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
             dispatchHotReload(processInfo, packageName);
         }
         return dispatch;
+    }
+
+    /**
+     * The endpoint a process offered so the daemon can ask it to reload a module (API 102).
+     *
+     * <p>It has to come from the process: the heartbeat the daemon tracks is a plain binder that
+     * only reports death, and the hook that would route a request on it exists in system_server
+     * alone.</p>
+     */
+    @Override
+    public void registerHotReloadEndpoint(IBinder endpoint) {
+        try {
+            var processInfo = ensureRegistered();
+            processInfo.reloadEndpoint = endpoint;
+            Log.d(TAG, processInfo.processName + " offered a hot reload endpoint");
+        } catch (RemoteException e) {
+            Log.w(TAG, "Hot reload endpoint from an unregistered process: " + e.getMessage());
+        }
     }
 
     /**
@@ -334,10 +365,20 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
     }
 
     private static void dispatchHotReload(ProcessInfo processInfo, String packageName) {
-        // Extras are reserved for the service-triggered path, which passes them; a module update
-        // has nothing to hand over.
-        if (!BridgeService.requestHotReload(processInfo.heartBeat, packageName, null)) {
-            Log.w(TAG, "Cannot reach " + processInfo.processName + " for a hot reload");
+        var data = Parcel.obtain();
+        try {
+            data.writeString(packageName);
+            // Extras are reserved for the service-triggered path, which passes them; a module
+            // update has nothing to hand over.
+            data.writeBundle(null);
+            // Oneway: the callee runs module code the daemon has no deadline over, and the outcome
+            // comes back through reportHotReloadResult rather than in a reply.
+            processInfo.reloadEndpoint.transact(ILSPApplicationService.HOT_RELOAD_TRANSACTION_CODE,
+                    data, null, IBinder.FLAG_ONEWAY);
+        } catch (RemoteException e) {
+            Log.w(TAG, "Cannot reach " + processInfo.processName + " for a hot reload: " + e.getMessage());
+        } finally {
+            data.recycle();
         }
     }
 

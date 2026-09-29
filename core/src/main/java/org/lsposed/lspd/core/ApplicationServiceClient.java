@@ -113,6 +113,15 @@ public class ApplicationServiceClient implements ILSPApplicationService, IBinder
     }
 
     @Override
+    public void registerHotReloadEndpoint(IBinder endpoint) {
+        try {
+            service.registerHotReloadEndpoint(endpoint);
+        } catch (RemoteException | NullPointerException e) {
+            Utils.logW("cannot offer the hot reload endpoint", e);
+        }
+    }
+
+    @Override
     public IBinder asBinder() {
         return service.asBinder();
     }

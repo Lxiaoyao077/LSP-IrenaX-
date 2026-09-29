@@ -3,12 +3,10 @@ package org.lsposed.lspd.service;
 import static org.lsposed.lspd.service.ServiceManager.TAG;
 
 import android.app.ActivityManager;
-import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.Parcel;
-import android.os.RemoteException;
 import android.os.ServiceManager;
 import android.system.ErrnoException;
 import android.system.Os;
@@ -25,39 +23,10 @@ public class BridgeService {
     private static final String DESCRIPTOR = "LSPosed";
     private static final String SERVICE_NAME = "activity";
 
-    /**
-     * The actions this protocol carries. Written out rather than taken from an enum's ordinal: the
-     * injected process reads the same numbers, and a new action appended to an enum would renumber
-     * nothing today and everything later.
-     */
-    private static final int ACTION_SEND_BINDER = 1;
-    /** Hot reload of one module; must stay in step with the injected process's own action table. */
-    private static final int ACTION_HOT_RELOAD = 4;
-
-    /**
-     * Asks an injected process to reload one module (API 102), on the heartbeat binder it already
-     * registered with the daemon.
-     *
-     * <p>Oneway, because the callee runs module code the daemon has no deadline over, and because
-     * the answer is not a value but a state change: the process reports the outcome through
-     * {@code ILSPApplicationService#reportHotReloadResult} whether or not anything is waiting.</p>
-     *
-     * @return whether the request was handed to the transport, not whether the module reloaded
-     */
-    static boolean requestHotReload(IBinder heartBeat, String packageName, Bundle extras) {
-        var data = Parcel.obtain();
-        try {
-            data.writeInterfaceToken(DESCRIPTOR);
-            data.writeInt(ACTION_HOT_RELOAD);
-            data.writeString(packageName);
-            data.writeBundle(extras);
-            return heartBeat.transact(TRANSACTION_CODE, data, null, IBinder.FLAG_ONEWAY);
-        } catch (RemoteException e) {
-            Log.w(TAG, "cannot reach a process for a hot reload: " + e.getMessage());
-            return false;
-        } finally {
-            data.recycle();
-        }
+    enum ACTION {
+        ACTION_UNKNOWN,
+        ACTION_SEND_BINDER,
+        ACTION_GET_BINDER,
     }
 
     public interface Listener {
@@ -164,7 +133,7 @@ public class BridgeService {
             for (int i = 0; i < 3; i++) {
                 try {
                     data.writeInterfaceToken(DESCRIPTOR);
-                    data.writeInt(ACTION_SEND_BINDER);
+                    data.writeInt(ACTION.ACTION_SEND_BINDER.ordinal());
                     Log.v(TAG, "binder " + binder.toString());
                     data.writeStrongBinder(binder);
                     if (bridgeService == null) break;
