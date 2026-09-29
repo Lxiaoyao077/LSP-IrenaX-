@@ -240,6 +240,9 @@ public class LSPModuleService extends IXposedService.Stub {
     // from module.prop targetApiVersion (API 100 modules don't declare it), so
     // they keep working untouched. tbh idk if this survives the next API bump,
     // but it's the only way to serve both APIs right now.
+    //
+    // it did survive it: API 102 keeps the API 101 shapes, so `>= 101` still
+    // separates the two wires and 102 modules ride the newer one.
 
     private static final int TRANSACTION_GET_FRAMEWORK_PRIVILEGE = 6;
     private static final int TRANSACTION_REQUEST_SCOPE = 12;

@@ -26,6 +26,7 @@ import android.app.ActivityThread;
 import android.app.IApplicationThread;
 import android.content.Context;
 import android.os.Binder;
+import android.os.Bundle;
 import android.os.IBinder;
 import android.os.Parcel;
 import android.os.RemoteException;
@@ -34,12 +35,22 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import org.lsposed.lspd.BuildConfig;
+import org.lsposed.lspd.impl.LSPosedContext;
 import org.lsposed.lspd.util.Utils.Log;
 
 public class BridgeService {
     private static final int TRANSACTION_CODE = ('_' << 24) | ('L' << 16) | ('S' << 8) | 'P';
     private static final String DESCRIPTOR = "LSPosed";
     protected static final String TAG = "LSPosed-Bridge";
+
+    /**
+     * The daemon's way back into a process for hot reload (API 102). It rides the heartbeat binder
+     * the process already registers with the daemon, which nothing transacts on otherwise, so no
+     * new interface has to be published to reach a process that is already running a module.
+     *
+     * <p>Must stay in step with {@code LSPApplicationService.HOT_RELOAD_TRANSACTION_CODE}.</p>
+     */
+    private static final int HOT_RELOAD_TRANSACTION_CODE = ('_' << 24) | ('H' << 16) | ('R' << 8) | 'L';
 
     enum ACTION {
         ACTION_UNKNOWN,
@@ -153,6 +164,7 @@ public class BridgeService {
 
     @SuppressWarnings("unused")
     public static boolean execTransact(IBinder obj, int code, long dataObj, long replyObj, int flags) {
+        if (code == HOT_RELOAD_TRANSACTION_CODE) return execHotReload(dataObj, replyObj);
         if (code != TRANSACTION_CODE) return false;
 
         Parcel data = ParcelUtils.fromNativePointer(dataObj);
@@ -176,6 +188,40 @@ public class BridgeService {
                 Log.w(TAG, "on transact", e);
                 return true;
             }
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    /**
+     * Reloads a module the daemon has just replaced on disk.
+     *
+     * <p>Every binder in this process runs through here, so the request is recognised by its code
+     * alone. The module is asked first and may refuse; when it refuses, or when it is not loaded
+     * in this process at all, the transaction reports so and nothing changes.</p>
+     */
+    private static boolean execHotReload(long dataObj, long replyObj) {
+        Parcel data = ParcelUtils.fromNativePointer(dataObj);
+        Parcel reply = ParcelUtils.fromNativePointer(replyObj);
+
+        if (data == null || reply == null) {
+            Log.w(TAG, "Got a hot reload transaction with null data or reply");
+            return false;
+        }
+
+        try {
+            var packageName = data.readString();
+            var extras = data.readBundle(BridgeService.class.getClassLoader());
+            var reloaded = packageName != null && LSPosedContext.requestHotReload(packageName, extras);
+            reply.writeNoException();
+            reply.writeBoolean(reloaded);
+            return true;
+        } catch (Throwable e) {
+            Log.w(TAG, "hot reload", e);
+            reply.setDataPosition(0);
+            reply.writeException(new IllegalStateException(e));
+            return true;
         } finally {
             data.recycle();
             reply.recycle();

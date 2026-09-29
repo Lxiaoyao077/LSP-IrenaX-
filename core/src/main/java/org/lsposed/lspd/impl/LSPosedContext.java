@@ -5,6 +5,7 @@ import android.app.ActivityThread;
 import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.DeadSystemException;
 import android.os.ParcelFileDescriptor;
 import android.os.Process;
@@ -14,6 +15,7 @@ import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import org.lsposed.lspd.core.ApplicationServiceClient;
 import org.lsposed.lspd.core.BuildConfig;
 import org.lsposed.lspd.impl.utils.LSPosedDexParser;
 import org.lsposed.lspd.models.Module;
@@ -35,6 +37,8 @@ import java.nio.ByteBuffer;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.UnknownHostException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -63,12 +67,38 @@ public class LSPosedContext implements XposedInterface {
     private final ExceptionMode mDefaultExceptionMode;
     private final Map<String, SharedPreferences> mRemotePrefs = new ConcurrentHashMap<>();
 
+    /**
+     * Set while this generation is on its way out. A hook registered by retired code would outlive
+     * the swap and keep the old classloader reachable through its hooker, which is the one thing a
+     * reload exists to prevent, so registration is closed once the reload has been accepted.
+     */
+    private volatile boolean mFrozen = false;
+
     LSPosedContext(String packageName, ApplicationInfo applicationInfo, ILSPInjectedModuleService service,
                    ExceptionMode defaultExceptionMode) {
         this.mPackageName = packageName;
         this.mApplicationInfo = applicationInfo;
         this.service = service;
         this.mDefaultExceptionMode = defaultExceptionMode;
+    }
+
+    void freeze() {
+        mFrozen = true;
+    }
+
+    void unfreeze() {
+        mFrozen = false;
+    }
+
+    /**
+     * Refuses registration once this generation has been accepted for retirement. Consulted both
+     * when a hook builder is handed out and when it is used, because a builder handed out just
+     * before the reload was accepted is still in the module's hands.
+     */
+    void checkNotFrozen() {
+        if (mFrozen) {
+            throw new IllegalStateException("Cannot register hooks from a retired module generation");
+        }
     }
 
     // module lifecycle dispatch: fire every callback, modules react to what they override.
@@ -123,18 +153,50 @@ public class LSPosedContext implements XposedInterface {
         }
     }
 
+    /**
+     * The entry classes of one module package as they are currently loaded, together with the
+     * framework interface they were attached to.
+     *
+     * <p>A reload replaces this whole object. The new generation is built next to the old one and
+     * only then takes its place, so no call ever sees the module half rebuilt.</p>
+     */
+    private static final class Generation {
+        final ClassLoader classLoader;
+        final LSPosedContext context;
+        final List<XposedModule> entries;
+
+        Generation(ClassLoader classLoader, LSPosedContext context, List<XposedModule> entries) {
+            this.classLoader = classLoader;
+            this.context = context;
+            this.entries = entries;
+        }
+    }
+
+    /** Live generations by module package name, so a reload can find what it has to retire. */
+    private static final Map<String, Generation> generations = new ConcurrentHashMap<>();
+
+    /** One lock per module, so reloads of the same module queue instead of interleaving. */
+    private static final Map<String, Object> reloadLocks = new ConcurrentHashMap<>();
+
+    private static final class ModuleLoadedParamImpl implements XposedModuleInterface.ModuleLoadedParam {
+        @Override
+        public boolean isSystemServer() {
+            return LSPosedContext.isSystemServer;
+        }
+
+        @NonNull
+        @Override
+        public String getProcessName() {
+            return LSPosedContext.processName;
+        }
+    }
+
     @SuppressLint("DiscouragedPrivateApi")
     public static boolean loadModule(ActivityThread at, Module module) {
         try {
             Log.d(TAG, "Loading module " + module.packageName);
-            var sb = new StringBuilder();
-            var abis = Process.is64Bit() ? Build.SUPPORTED_64_BIT_ABIS : Build.SUPPORTED_32_BIT_ABIS;
-            for (String abi : abis) {
-                sb.append(module.apkPath).append("!/lib/").append(abi).append(File.pathSeparator);
-            }
-            var librarySearchPath = sb.toString();
             var initLoader = XposedModule.class.getClassLoader();
-            var mcl = LspModuleClassLoader.loadApk(module.apkPath, module.file.preLoadedDexes, librarySearchPath, initLoader);
+            var mcl = loadModuleApk(module, initLoader);
             if (mcl.loadClass(XposedModule.class.getName()).getClassLoader() != initLoader) {
                 Log.e(TAG, "  Cannot load module: " + module.packageName);
                 Log.e(TAG, "  The Xposed API classes are compiled into the module's APK.");
@@ -142,62 +204,284 @@ public class LSPosedContext implements XposedInterface {
                 return false;
             }
             module.file.moduleLibraryNames.forEach(NativeAPI::recordNativeEntrypoint);
-            var defaultExceptionMode = module.file.exceptionPassthrough ? ExceptionMode.PASSTHROUGH : ExceptionMode.PROTECTIVE;
-            var ctx = new LSPosedContext(module.packageName, module.applicationInfo, module.service, defaultExceptionMode);
-            for (var entry : module.file.moduleClassNames) {
-                var moduleClass = mcl.loadClass(entry);
-                Log.d(TAG, "  Loading class " + moduleClass);
-                if (!XposedModule.class.isAssignableFrom(moduleClass)) {
-                    Log.e(TAG, "    This class doesn't implement any sub-interface of XposedModule, skipping it");
-                    continue;
-                }
-                try {
-                    // API 100 modules take a (XposedInterface, ModuleLoadedParam) ctor, API 101
-                    // modules use no-arg + attachFramework. try API 100 first, fall back to
-                    // API 101, decided per module so nobody has to configure anything.
-                    XposedModule moduleContext;
-                    try {
-                        var moduleEntry = moduleClass.getConstructor(XposedInterface.class,
-                                XposedModuleInterface.ModuleLoadedParam.class);
-                        moduleContext = (XposedModule) moduleEntry.newInstance(ctx, new XposedModuleInterface.ModuleLoadedParam() {
-                            @Override
-                            public boolean isSystemServer() {
-                                return LSPosedContext.isSystemServer;
-                            }
-
-                            @NonNull
-                            @Override
-                            public String getProcessName() {
-                                return LSPosedContext.processName;
-                            }
-                        });
-                    } catch (NoSuchMethodException e) {
-                        moduleContext = (XposedModule) moduleClass.getConstructor().newInstance();
-                        moduleContext.attachFramework(ctx);
-                    }
-                    moduleContext.onModuleLoaded(new XposedModuleInterface.ModuleLoadedParam() {
-                        @Override
-                        public boolean isSystemServer() {
-                            return LSPosedContext.isSystemServer;
-                        }
-
-                        @NonNull
-                        @Override
-                        public String getProcessName() {
-                            return LSPosedContext.processName;
-                        }
-                    });
-                    modules.add(moduleContext);
-                } catch (Throwable e) {
-                    Log.e(TAG, "    Failed to load class " + moduleClass, e);
-                }
-            }
-            Log.d(TAG, "Loaded module " + module.packageName + ": " + ctx);
+            var generation = instantiate(module, mcl, true);
+            generations.put(module.packageName, generation);
+            Log.d(TAG, "Loaded module " + module.packageName + ": " + generation.context);
         } catch (Throwable e) {
             Log.d(TAG, "Loading module " + module.packageName, e);
             return false;
         }
         return true;
+    }
+
+    /**
+     * Loads a module's code into the process.
+     *
+     * <p>A module that targets 102 or higher is built against a framework that no longer offers
+     * the legacy API, so the loader stops resolving it: legacy state is global and static, which
+     * means anything holding on to it outlives a reload in a way the framework cannot clean up.
+     * The names to refuse are not the ones written in source whenever dex obfuscation is on, so
+     * they are resolved through the same map the rest of the framework uses.</p>
+     */
+    private static ClassLoader loadModuleApk(Module module, ClassLoader initLoader) {
+        var sb = new StringBuilder();
+        var abis = Process.is64Bit() ? Build.SUPPORTED_64_BIT_ABIS : Build.SUPPORTED_32_BIT_ABIS;
+        for (String abi : abis) {
+            sb.append(module.apkPath).append("!/lib/").append(abi).append(File.pathSeparator);
+        }
+        var librarySearchPath = sb.toString();
+        var blockLegacyApi = module.file != null
+                && module.file.targetApiVersion >= XposedInterface.API_102;
+        return LspModuleClassLoader.loadApk(module.apkPath, module.file.preLoadedDexes,
+                librarySearchPath, initLoader, blockLegacyApi);
+    }
+
+    /**
+     * Builds a generation from a module's already-loaded code.
+     *
+     * @param firstLoad whether this is the initial load, which is the only time
+     *                  {@link XposedModuleInterface#onModuleLoaded} is delivered: the interface
+     *                  says a reload does not replay it, so new code hears about the swap through
+     *                  {@link XposedModuleInterface#onHotReloaded} instead
+     */
+    private static Generation instantiate(Module module, ClassLoader mcl, boolean firstLoad) {
+        var defaultExceptionMode = module.file.exceptionPassthrough ? ExceptionMode.PASSTHROUGH : ExceptionMode.PROTECTIVE;
+        var ctx = new LSPosedContext(module.packageName, module.applicationInfo, module.service, defaultExceptionMode);
+        var entries = new ArrayList<XposedModule>();
+        for (var entry : module.file.moduleClassNames) {
+            var moduleClass = mcl.loadClass(entry);
+            Log.d(TAG, "  Loading class " + moduleClass);
+            if (!XposedModule.class.isAssignableFrom(moduleClass)) {
+                Log.e(TAG, "    This class doesn't implement any sub-interface of XposedModule, skipping it");
+                continue;
+            }
+            try {
+                entries.add(instantiateEntry(moduleClass, ctx, firstLoad));
+            } catch (Throwable e) {
+                Log.e(TAG, "    Failed to load class " + moduleClass, e);
+            }
+        }
+        return new Generation(mcl, ctx, entries);
+    }
+
+    private static XposedModule instantiateEntry(Class<?> moduleClass, LSPosedContext ctx, boolean firstLoad)
+            throws Throwable {
+        XposedModule moduleContext;
+        try {
+            // API 100 modules take a (XposedInterface, ModuleLoadedParam) ctor, API 101 and 102
+            // modules use no-arg + attachFramework. try API 100 first, fall back to the no-arg
+            // one, decided per module so nobody has to configure anything.
+            var moduleEntry = moduleClass.getConstructor(XposedInterface.class,
+                    XposedModuleInterface.ModuleLoadedParam.class);
+            moduleContext = (XposedModule) moduleEntry.newInstance(ctx, new ModuleLoadedParamImpl());
+        } catch (NoSuchMethodException e) {
+            var entry = (XposedModule) moduleClass.getConstructor().newInstance();
+            // From 102 an entry can leave the lifecycle on its own, and only for itself: the
+            // framework holds the reference, so it is the one that has to be able to drop it,
+            // while a sibling entry of the same module keeps receiving its callbacks.
+            entry.attachFramework(ctx, () -> modules.remove(entry));
+            moduleContext = entry;
+        }
+        modules.add(moduleContext);
+        // An entry that detached from its own constructor never asked for callbacks at all.
+        if (firstLoad && modules.contains(moduleContext)) {
+            try {
+                moduleContext.onModuleLoaded(new ModuleLoadedParamImpl());
+            } catch (Throwable t) {
+                // It is still subscribed, and it is not going to be part of any generation, so
+                // nothing would ever take it out again.
+                modules.remove(moduleContext);
+                throw t;
+            }
+        }
+        return moduleContext;
+    }
+
+    /**
+     * Reloads a module into this process (API 102).
+     *
+     * <p>The old generation is asked first and nothing is disturbed until it agrees. Then its hook
+     * registration is closed and its installed hooks are collected, and only after that is the new
+     * generation built from the module's current APK - by which point the daemon has already
+     * re-read it. The two generations are never both able to answer a call: the swap happens once
+     * the new one is complete, and the handles the old one left are handed to the new code to
+     * retire or take over.</p>
+     *
+     * <p>Reloads are serialised per module, so two updates arriving together cannot both freeze the
+     * same generation and then race to replace it.</p>
+     *
+     * @param packageName the module to reload
+     * @param extras      what the caller passed along, or {@code null}
+     * @return whether the module was reloaded
+     */
+    public static boolean requestHotReload(String packageName, Bundle extras) {
+        synchronized (reloadLocks.computeIfAbsent(packageName, k -> new Object())) {
+            return reloadLocked(packageName, extras);
+        }
+    }
+
+    private static boolean reloadLocked(String packageName, Bundle extras) {
+        var previous = generations.get(packageName);
+        if (previous == null) {
+            Log.d(TAG, "Hot reload of " + packageName + " requested, but it is not loaded here");
+            return false;
+        }
+
+        var reloading = new HotReloadingParamImpl(extras, previous.classLoader);
+        var asked = false;
+        for (var entry : previous.entries) {
+            // An entry that detached asked to be left out of every lifecycle callback, and being
+            // asked about a reload is one.
+            if (!modules.contains(entry)) continue;
+            asked = true;
+            boolean accepted;
+            try {
+                accepted = entry.onHotReloading(reloading);
+            } catch (Throwable t) {
+                Log.e(TAG, "Error when calling onHotReloading of " + packageName, t);
+                return false;
+            }
+            if (!accepted) {
+                Log.d(TAG, "Hot reload of " + packageName + " refused");
+                return false;
+            }
+        }
+        if (!asked) {
+            // Nothing is left that could agree, and an unanswered question is not a yes.
+            Log.d(TAG, "Hot reload of " + packageName + " has no entry left to ask");
+            return false;
+        }
+
+        // Close registration before the handle list is read: a hook old code registered from here
+        // on would survive the swap and hold the retired classloader in place through its hooker.
+        previous.context.freeze();
+        var oldHandles = LSPosedBridge.HookRegistry.liveHandles(packageName);
+
+        var swapped = false;
+        try {
+            var module = findRefreshedModule(packageName);
+            if (module == null) {
+                Log.e(TAG, "Hot reload of " + packageName + " found no module to load");
+                return false;
+            }
+            var mcl = loadModuleApk(module, XposedModule.class.getClassLoader());
+            // The new entries are subscribed as they are built, so an entry that detaches while it
+            // is still being constructed lands here already out of the callback set.
+            var next = instantiate(module, mcl, false);
+            // The library names are re-recorded because an updated module may ship new ones; the
+            // old entry points keep working until the process ends.
+            module.file.moduleLibraryNames.forEach(NativeAPI::recordNativeEntrypoint);
+
+            modules.removeAll(previous.entries);
+            generations.put(packageName, next);
+            swapped = true;
+
+            var reloaded = new HotReloadedParamImpl(extras, reloading.savedInstanceState, oldHandles);
+            for (var entry : next.entries) {
+                if (!modules.contains(entry)) continue;
+                try {
+                    entry.onHotReloaded(reloaded);
+                } catch (Throwable t) {
+                    Log.e(TAG, "Error when calling onHotReloaded of " + packageName, t);
+                }
+            }
+            Log.i(TAG, "Hot reloaded module " + packageName);
+            return true;
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to hot reload " + packageName, t);
+            return false;
+        } finally {
+            // A reload that did not go through leaves the old code in charge, so it gets its
+            // registration back; a completed one stays retired for good.
+            if (!swapped) previous.context.unfreeze();
+        }
+    }
+
+    private static Module findRefreshedModule(String packageName) {
+        var client = ApplicationServiceClient.serviceClient;
+        if (client == null) return null;
+        for (var module : client.getModulesList()) {
+            if (packageName.equals(module.packageName)) return module;
+        }
+        return null;
+    }
+
+    private static final class HotReloadingParamImpl implements XposedModuleInterface.HotReloadingParam {
+        private final Bundle extras;
+        private final ClassLoader retiredLoader;
+        private Object savedInstanceState;
+
+        HotReloadingParamImpl(Bundle extras, ClassLoader retiredLoader) {
+            this.extras = extras;
+            this.retiredLoader = retiredLoader;
+        }
+
+        @Override
+        public Bundle getExtras() {
+            return extras;
+        }
+
+        @Override
+        public void setSavedInstanceState(Object outState) {
+            if (isFromRetiredLoader(outState)) {
+                throw new IllegalArgumentException(
+                        "Saved state must not hold objects created by the module classloader being retired");
+            }
+            this.savedInstanceState = outState;
+        }
+
+        /**
+         * Shallow test for whether an object was created by the generation being retired, or by a
+         * loader derived from it. It looks at the object itself and nothing it refers to, so it is
+         * a diagnostic rather than a guarantee: an object that slips through undetected is still a
+         * module lifecycle bug.
+         */
+        private boolean isFromRetiredLoader(Object object) {
+            if (object == null) return false;
+            for (var cl = object.getClass().getClassLoader(); cl != null; cl = cl.getParent()) {
+                if (cl == retiredLoader) return true;
+            }
+            return false;
+        }
+    }
+
+    private static final class HotReloadedParamImpl implements XposedModuleInterface.HotReloadedParam {
+        private final Bundle extras;
+        private final Object savedInstanceState;
+        private final List<XposedInterface.HookHandle> oldHookHandles;
+
+        HotReloadedParamImpl(Bundle extras, Object savedInstanceState, List<XposedInterface.HookHandle> oldHookHandles) {
+            this.extras = extras;
+            this.savedInstanceState = savedInstanceState;
+            this.oldHookHandles = oldHookHandles;
+        }
+
+        @Override
+        public boolean isSystemServer() {
+            return LSPosedContext.isSystemServer;
+        }
+
+        @NonNull
+        @Override
+        public String getProcessName() {
+            return LSPosedContext.processName;
+        }
+
+        @Override
+        public Bundle getExtras() {
+            return extras;
+        }
+
+        @Override
+        public Object getSavedInstanceState() {
+            return savedInstanceState;
+        }
+
+        @NonNull
+        @Override
+        public List<XposedInterface.HookHandle> getOldHookHandles() {
+            return oldHookHandles;
+        }
     }
 
     @NonNull
@@ -240,13 +524,15 @@ public class LSPosedContext implements XposedInterface {
     @Override
     @NonNull
     public HookBuilder hook(@NonNull Executable origin) {
-        return LSPosedBridge.newHookBuilder(this, origin, mDefaultExceptionMode);
+        checkNotFrozen();
+        return LSPosedBridge.newHookBuilder(this, origin, mPackageName, mDefaultExceptionMode);
     }
 
     @Override
     @NonNull
     public HookBuilder hookClassInitializer(@NonNull Class<?> origin) {
-        return LSPosedBridge.newClassInitializerHookBuilder(this, origin, mDefaultExceptionMode);
+        checkNotFrozen();
+        return LSPosedBridge.newClassInitializerHookBuilder(this, origin, mPackageName, mDefaultExceptionMode);
     }
 
     @Override

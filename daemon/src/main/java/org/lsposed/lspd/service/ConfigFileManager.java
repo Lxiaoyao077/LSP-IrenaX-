@@ -438,8 +438,12 @@ public class ConfigFileManager {
         if (properties == null) return null;
         int minApiVersion = readApiVersion(properties, "minApiVersion");
         int targetApiVersion = readApiVersion(properties, "targetApiVersion");
+        // Only what the module demands of us decides, and that is its floor. The libxposed API is
+        // cumulative, so a framework implementing 102 loads a module built against 101 just as
+        // well; comparing targetApiVersion against our own version would retire every module on
+        // the device the moment LIB_API moves.
         if (minApiVersion > LSPModuleService.XPOSED_API_VERSION) return null;
-        if (targetApiVersion < LSPModuleService.XPOSED_API_VERSION) return null;
+        if (targetApiVersion > LSPModuleService.XPOSED_API_VERSION) return null;
         return properties;
     }
 
@@ -449,7 +453,7 @@ public class ConfigFileManager {
         int minApiVersion = readApiVersion(properties, "minApiVersion");
         int targetApiVersion = readApiVersion(properties, "targetApiVersion");
         return minApiVersion > LSPModuleService.XPOSED_API_VERSION
-                || targetApiVersion >= LSPModuleService.XPOSED_API_VERSION;
+                || targetApiVersion > LSPModuleService.XPOSED_API_VERSION;
     }
 
     private static boolean isExceptionPassthrough(Properties properties) {
@@ -457,6 +461,18 @@ public class ConfigFileManager {
             return false;
         }
         return "passthrough".equals(properties.getProperty("exceptionMode", "").trim());
+    }
+
+    /**
+     * Whether the module opted into being reloaded when its package is updated, which is what
+     * {@code autoHotReload = true} in module.prop asks for (API 102). Off unless declared, because
+     * a reload retires the old generation and a module has to be written for that.
+     */
+    private static boolean isAutoHotReload(Properties properties) {
+        if (properties == null) {
+            return false;
+        }
+        return Boolean.parseBoolean(properties.getProperty("autoHotReload", "").trim());
     }
 
     @Nullable
@@ -482,6 +498,7 @@ public class ConfigFileManager {
                 file.legacy = false;
                 readName(apkFile, "META-INF/xposed/native_init.list", moduleLibraryNames);
                 file.exceptionPassthrough = isExceptionPassthrough(properties);
+                file.autoHotReload = isAutoHotReload(properties);
                 if (properties != null) {
                     // libxposed API version the module was built against. API 100 modules
                     // don't declare it, so 0 means "speaks API 100" (LSPModuleService#speaksApi101)

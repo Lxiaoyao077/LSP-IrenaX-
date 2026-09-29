@@ -178,6 +178,15 @@ public class LSPosedService extends ILSPosedService.Stub {
                     }
                 }
                 broadcastAndShowNotification(moduleName, userId, intent, isXposedModule);
+
+                if (isXposedModule && intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)) {
+                    // API 102: the module's code on disk just changed, so hand the new one to the
+                    // processes already running the old one instead of waiting for them to die with
+                    // it. The module cache is refreshed first, because an update keeps the apk path
+                    // and nothing else on this path would re-read its dex.
+                    ConfigManager.getInstance().updateCache();
+                    LSPApplicationService.requestHotReload(moduleName);
+                }
             }
             case Intent.ACTION_UID_REMOVED -> {
                 // when a package is removed (rather than hide) for a single user

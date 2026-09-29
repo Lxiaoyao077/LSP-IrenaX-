@@ -21,6 +21,7 @@ package org.lsposed.lspd.service;
 
 import static org.lsposed.lspd.service.ServiceManager.TAG;
 
+import android.os.Bundle;
 import android.os.IBinder;
 import android.os.Parcel;
 import android.os.ParcelFileDescriptor;
@@ -42,6 +43,13 @@ import java.util.stream.Collectors;
 public class LSPApplicationService extends ILSPApplicationService.Stub {
     final static int DEX_TRANSACTION_CODE = 1310096052;
     final static int OBFUSCATION_MAP_TRANSACTION_CODE = 724533732;
+
+    /**
+     * The code the injected process recognises as a hot reload request (API 102) in
+     * {@code org.lsposed.lspd.service.BridgeService.execTransact}.
+     */
+    final static int HOT_RELOAD_TRANSACTION_CODE = ('_' << 24) | ('H' << 16) | ('R' << 8) | 'L';
+
     // key: <uid, pid>
     private final static Map<Pair<Integer, Integer>, ProcessInfo> processes = new ConcurrentHashMap<>();
 
@@ -159,6 +167,58 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
 
     public boolean hasRegister(int uid, int pid) {
         return processes.containsKey(new Pair<>(uid, pid));
+    }
+
+    /**
+     * Asks every process that has {@code packageName} in scope to reload it (API 102).
+     *
+     * <p>A module is one package and one binary for the whole device, so replacing it has to reach
+     * every process that is already running the old code. The daemon tracks processes rather than
+     * modules, and the scope of a module is what says which of them has it loaded.</p>
+     *
+     * <p>An update is only offered to a module that declared {@code autoHotReload}: a reload
+     * retires the generation in place, and a module that never asked for it is one that has not
+     * been written to be retired.</p>
+     */
+    static void requestHotReload(String packageName) {
+        for (var processInfo : processes.values()) {
+            var optedIn = false;
+            for (var module : modulesForProcess(processInfo)) {
+                if (packageName.equals(module.packageName)) {
+                    optedIn = module.file != null && module.file.autoHotReload;
+                    break;
+                }
+            }
+            if (optedIn) dispatchHotReload(processInfo, packageName);
+        }
+    }
+
+    /**
+     * The modules a process would be handed if it asked now, which is not always the cached scope:
+     * the system server loads its scope straight from the database, so it is not in that table.
+     */
+    private static List<Module> modulesForProcess(ProcessInfo processInfo) {
+        if (processInfo.uid == Process.SYSTEM_UID && "system".equals(processInfo.processName)) {
+            return ConfigManager.getInstance().getModulesForSystemServer();
+        }
+        return ConfigManager.getInstance().getModulesForProcess(processInfo.processName, processInfo.uid);
+    }
+
+    private static void dispatchHotReload(ProcessInfo processInfo, String packageName) {
+        var data = Parcel.obtain();
+        try {
+            data.writeString(packageName);
+            // Extras are reserved for the service-triggered path, which passes them; a module
+            // update has nothing to hand over.
+            data.writeBundle(null);
+            // Oneway: the callee runs module code, which the daemon has no deadline over, and the
+            // outcome is the process's to log.
+            processInfo.heartBeat.transact(HOT_RELOAD_TRANSACTION_CODE, data, null, IBinder.FLAG_ONEWAY);
+        } catch (RemoteException e) {
+            Log.w(TAG, "Cannot reach " + processInfo.processName + " for a hot reload", e);
+        } finally {
+            data.recycle();
+        }
     }
 
     @NonNull
