@@ -3,6 +3,23 @@ package org.lsposed.lspd.service;
 import org.lsposed.lspd.models.Module;
 
 interface ILSPApplicationService {
+    /**
+     * The code a process's hot reload endpoint answers to (API 102), carrying the module package
+     * name and the extras to pass along. The four bytes are '_HRL', in the shape of the codes
+     * already on this wire.
+     */
+    const int HOT_RELOAD_TRANSACTION_CODE = 1598575180;
+
+    /** The reload has been asked for and has not reported back yet. */
+    const int HOT_RELOAD_IN_PROGRESS = 0;
+    const int HOT_RELOAD_SUCCEEDED = 1;
+    /** The old generation said no, or there was nothing left in it that could agree. */
+    const int HOT_RELOAD_REFUSED = 2;
+    /** The swap itself threw. The old generation is the one still running. */
+    const int HOT_RELOAD_FAILED = 3;
+    /** This process does not have the module, or could not find it to reload. */
+    const int HOT_RELOAD_NOT_LOADED = 4;
+
     boolean isLogMuted();
 
     List<Module> getLegacyModulesList();
@@ -25,26 +42,10 @@ interface ILSPApplicationService {
     /**
      * Offers the daemon the binder it can ask this process to reload a module on (API 102).
      *
-     * <p>A process has to offer one. The heartbeat the daemon already holds is a stock android.os.Binder
-     * the native side creates before the framework dex exists, and the hook that would route
-     * anything else sent to it is installed in system_server alone - so a request aimed at any
-     * other process is dropped, silently.</p>
+     * <p>A process has to offer one. The heartbeat the daemon already holds is a stock
+     * android.os.Binder the native side creates before the framework dex exists, and the hook that
+     * would route anything else sent to it is installed in system_server alone - so a request aimed
+     * at any other process is dropped, silently.</p>
      */
     void registerHotReloadEndpoint(IBinder endpoint);
-
-    /**
-     * The code the endpoint registered through registerHotReloadEndpoint answers to, carrying the
-     * module package name and the extras to pass along. The four bytes are '_HRL', in the shape of
-     * the codes already on this wire.
-     */
-    const int HOT_RELOAD_TRANSACTION_CODE = 1598575180;
-
-    const int HOT_RELOAD_IN_PROGRESS = 0;
-    const int HOT_RELOAD_SUCCEEDED = 1;
-    /** The old generation said no, or there was nothing left in it that could agree. */
-    const int HOT_RELOAD_REFUSED = 2;
-    /** The swap itself threw. The old generation is the one still running. */
-    const int HOT_RELOAD_FAILED = 3;
-    /** This process does not have the module, or could not find it to reload. */
-    const int HOT_RELOAD_NOT_LOADED = 4;
 }
