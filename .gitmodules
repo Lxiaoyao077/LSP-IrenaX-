@@ -1,5 +1,5 @@
-[submodule "external/plth"]
-	path = external/plth
+[submodule "external/plti"]
+	path = external/plti
 	url = https://github.com/PerformanC/PLTI.git
 [submodule "external/lsplant"]
 	path = external/lsplant
