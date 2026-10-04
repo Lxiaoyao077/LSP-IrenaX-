@@ -34,11 +34,16 @@ import androidx.annotation.NonNull;
 
 import org.lsposed.lspd.models.Module;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
+
+import io.github.libxposed.service.HookedProcess;
+import io.github.libxposed.service.IHotReloadCallback;
+import io.github.libxposed.service.IXposedService;
 
 public class LSPApplicationService extends ILSPApplicationService.Stub {
     final static int DEX_TRANSACTION_CODE = 1310096052;
@@ -75,6 +80,11 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
             /** Last reported outcome, one of the {@code ILSPApplicationService.HOT_RELOAD_*} values. */
             volatile int status = ILSPApplicationService.HOT_RELOAD_IN_PROGRESS;
             volatile String message;
+            /**
+             * The callback a module app left behind when it asked for this reload through the
+             * service (API 102), or {@code null}; consumed by the first outcome report.
+             */
+            volatile IHotReloadCallback serviceCallback;
 
             boolean runs(String build) {
                 return build != null && build.equals(delivered);
@@ -110,6 +120,12 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
             Log.d(TAG, this + " is dead");
             heartBeat.unlinkToDeath(this, 0);
             processes.remove(new Pair<>(uid, pid), this);
+            // a module app may still be waiting on a reload this process never reported
+            for (var target : targets.values()) {
+                var callback = target.serviceCallback;
+                target.serviceCallback = null;
+                if (callback != null) notifyServiceHotReloadResult(callback, IXposedService.HOT_RELOAD_PROCESS_DIED, null);
+            }
         }
 
         @NonNull
@@ -249,14 +265,7 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
 
         for (var processInfo : processes.values()) {
             if (processInfo.heartBeat == null) continue;
-            var inScope = false;
-            for (var scoped : modulesForProcess(processInfo)) {
-                if (packageName.equals(scoped.packageName)) {
-                    inScope = true;
-                    break;
-                }
-            }
-            if (!inScope) continue;
+            if (!isModuleInScope(processInfo, packageName)) continue;
 
             var target = processInfo.target(packageName);
             if (!target.runs(build)) dispatch.stale++;
@@ -321,10 +330,18 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
         var target = processInfo.target(packageName);
         target.status = status;
         target.message = message;
-        if (status != ILSPApplicationService.HOT_RELOAD_SUCCEEDED) {
+        if (status == ILSPApplicationService.HOT_RELOAD_SUCCEEDED) {
+            // The process now runs the build that was asked of it.
+            target.delivered = target.requested;
+        } else {
             // Nothing here knows what the process is running any more, and treating it as current
             // would hide exactly the state a restart is meant to fix.
             target.delivered = null;
+        }
+        var callback = target.serviceCallback;
+        target.serviceCallback = null;
+        if (callback != null) {
+            notifyServiceHotReloadResult(callback, rawHotReloadStatus(status), message);
         }
         Log.i(TAG, processInfo.processName + " hot reload of " + packageName + ": " + describe(target));
     }
@@ -363,13 +380,121 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
         return ConfigManager.getInstance().getModulesForProcess(processInfo.processName, processInfo.uid);
     }
 
+    /**
+     * The running targets of one module, as the service interface serves them (API 102). A
+     * process counts when the module is in its scope; its state is read from the reload
+     * bookkeeping, and a process that has not reported anything yet counts as stale.
+     */
+    static List<HookedProcess> getRunningTargets(String packageName) {
+        var build = ConfigManager.getInstance().getModuleBuild(packageName);
+        var result = new ArrayList<HookedProcess>();
+        for (var processInfo : processes.values()) {
+            if (processInfo.heartBeat == null) continue;
+            if (!isModuleInScope(processInfo, packageName)) continue;
+            var hooked = new HookedProcess();
+            hooked.targetId = targetIdOf(processInfo);
+            hooked.uid = processInfo.uid;
+            hooked.pid = processInfo.pid;
+            hooked.processName = processInfo.processName;
+            hooked.state = targetState(processInfo.targets.get(packageName), build);
+            result.add(hooked);
+        }
+        return result;
+    }
+
+    /** The opaque, process-scoped token {@code HookedProcess} hands back to module apps. */
+    static long targetIdOf(ProcessInfo processInfo) {
+        return ((long) processInfo.uid << 32) | (processInfo.pid & 0xFFFFFFFFL);
+    }
+
+    private static int targetState(ProcessInfo.Target target, String build) {
+        if (target == null) return HookedProcess.TARGET_STATE_STALE;
+        if (target.status == ILSPApplicationService.HOT_RELOAD_IN_PROGRESS) {
+            return HookedProcess.TARGET_STATE_RELOADING;
+        }
+        if (target.status == ILSPApplicationService.HOT_RELOAD_REFUSED
+                || target.status == ILSPApplicationService.HOT_RELOAD_FAILED) {
+            return HookedProcess.TARGET_STATE_FAILED;
+        }
+        return target.runs(build) ? HookedProcess.TARGET_STATE_UP_TO_DATE : HookedProcess.TARGET_STATE_STALE;
+    }
+
+    static ProcessInfo findProcessByTargetId(long targetId) {
+        for (var processInfo : processes.values()) {
+            if (targetIdOf(processInfo) == targetId) return processInfo;
+        }
+        return null;
+    }
+
+    static boolean isModuleInScope(ProcessInfo processInfo, String packageName) {
+        for (var scoped : modulesForProcess(processInfo)) {
+            if (packageName.equals(scoped.packageName)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * A module app asked for its own module to be reloaded in one running target (API 102).
+     * The module code still has the final word - only the update path is gated on the
+     * {@code autoHotReload} declaration, because this caller is the module itself.
+     */
+    static void requestServiceHotReload(ProcessInfo processInfo, String packageName, Bundle extras, IHotReloadCallback callback) {
+        var target = processInfo.target(packageName);
+        if (target.status == ILSPApplicationService.HOT_RELOAD_IN_PROGRESS) {
+            notifyServiceHotReloadResult(callback, IXposedService.HOT_RELOAD_IN_PROGRESS, null);
+            return;
+        }
+        var build = ConfigManager.getInstance().getModuleBuild(packageName);
+        if (build == null) {
+            // not a module on this device any more
+            notifyServiceHotReloadResult(callback, IXposedService.HOT_RELOAD_UNSUPPORTED, null);
+            return;
+        }
+        if (target.runs(build)) {
+            notifyServiceHotReloadResult(callback, IXposedService.HOT_RELOAD_SUCCEEDED, null);
+            return;
+        }
+        if (processInfo.reloadEndpoint == null) {
+            notifyServiceHotReloadResult(callback, IXposedService.HOT_RELOAD_UNSUPPORTED,
+                    processInfo.processName + " never offered a reload endpoint");
+            return;
+        }
+        target.requested = build;
+        target.status = ILSPApplicationService.HOT_RELOAD_IN_PROGRESS;
+        target.message = null;
+        target.serviceCallback = callback;
+        dispatchHotReload(processInfo, packageName, extras);
+    }
+
+    /** Maps the internal reload outcomes onto the raw statuses the service wire carries. */
+    private static int rawHotReloadStatus(int status) {
+        if (status == ILSPApplicationService.HOT_RELOAD_SUCCEEDED) return IXposedService.HOT_RELOAD_SUCCEEDED;
+        if (status == ILSPApplicationService.HOT_RELOAD_IN_PROGRESS) return IXposedService.HOT_RELOAD_IN_PROGRESS;
+        // refused, failed and not-loaded all read as failure to a module app; the message
+        // tells the three apart
+        return IXposedService.HOT_RELOAD_FAILED;
+    }
+
+    private static void notifyServiceHotReloadResult(IHotReloadCallback callback, int status, String message) {
+        if (callback == null) return;
+        try {
+            callback.onHotReloadResult(status, message);
+        } catch (RemoteException e) {
+            Log.w(TAG, "Cannot deliver the hot reload result", e);
+        }
+    }
+
     private static void dispatchHotReload(ProcessInfo processInfo, String packageName) {
+        dispatchHotReload(processInfo, packageName, null);
+    }
+
+    private static void dispatchHotReload(ProcessInfo processInfo, String packageName, Bundle extras) {
         var data = Parcel.obtain();
         try {
             data.writeString(packageName);
-            // Extras are reserved for the service-triggered path, which passes them; a module
-            // update has nothing to hand over.
-            data.writeBundle(null);
+            // A module-update reload has nothing to hand over; the service-triggered one
+            // passes what the module app asked along.
+            data.writeBundle(extras);
             // Oneway: the callee runs module code the daemon has no deadline over, and the outcome
             // comes back through reportHotReloadResult rather than in a reply.
             processInfo.reloadEndpoint.transact(ILSPApplicationService.HOT_RELOAD_TRANSACTION_CODE,
