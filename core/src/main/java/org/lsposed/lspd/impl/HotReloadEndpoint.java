@@ -26,7 +26,7 @@ import org.lsposed.lspd.service.ILSPApplicationService;
  */
 public final class HotReloadEndpoint extends Binder {
 
-    private static final String TAG = "LSPosedContext";
+    private static final String TAG = "HotReloadEndpoint";
 
     /**
      * Kept on purpose. The binder the daemon holds is only reachable through this reference, and a
@@ -77,7 +77,8 @@ public final class HotReloadEndpoint extends Binder {
         var reloaded = packageName != null && LSPosedContext.requestHotReload(packageName, extras);
         if (reply != null) {
             reply.writeNoException();
-            reply.writeBoolean(reloaded);
+            // Parcel#writeBoolean is API 29+ and the minSdk is lower; an int does the same job.
+            reply.writeInt(reloaded ? 1 : 0);
         }
         return true;
     }

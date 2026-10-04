@@ -820,6 +820,10 @@ public class LSPosedBridge {
         }
 
         synchronized (HookRegistry.lockOf(moduleId)) {
+            // Re-checked under the registry lock, which is the lock a hot reload freezes the
+            // generation under: a registration that started before the freeze cannot slip past
+            // it here and outlive the generation it belongs to.
+            if (context instanceof LSPosedContext moduleContext) moduleContext.checkNotFrozen();
             var existing = id == null ? null : HookRegistry.findId(moduleId, hookMethod, id);
             if (existing != null) {
                 // An id names one hook of one module on one executable, so registering it again

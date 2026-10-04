@@ -160,18 +160,9 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
         }
     }
 
-    private List<Module> allModulesList(ProcessInfo processInfo) throws RemoteException {
-        if (processInfo.uid == Process.SYSTEM_UID && processInfo.processName.equals("system")) {
-            return ConfigManager.getInstance().getModulesForSystemServer();
-        }
-        if (ServiceManager.getManagerService().isRunningManager(processInfo.pid, processInfo.uid))
-            return Collections.emptyList();
-        return ConfigManager.getInstance().getModulesForProcess(processInfo.processName, processInfo.uid);
-    }
-
     private List<Module> getAllModulesList() throws RemoteException {
         var processInfo = ensureRegistered();
-        var modules = allModulesList(processInfo);
+        var modules = modulesForProcess(processInfo);
         for (var module : modules) {
             // Serving the list is the moment the daemon hands over a build, and the closest it can
             // get to knowing what this process runs. On the next update that build is compared
@@ -360,6 +351,14 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
     private static List<Module> modulesForProcess(ProcessInfo processInfo) {
         if (processInfo.uid == Process.SYSTEM_UID && "system".equals(processInfo.processName)) {
             return ConfigManager.getInstance().getModulesForSystemServer();
+        }
+        // The manager is never handed modules, so it is never in a reload scope either - the same
+        // answer the module list gives it.
+        try {
+            if (ServiceManager.getManagerService().isRunningManager(processInfo.pid, processInfo.uid))
+                return Collections.emptyList();
+        } catch (RemoteException e) {
+            Log.w(TAG, "Cannot check whether " + processInfo.processName + " is the manager", e);
         }
         return ConfigManager.getInstance().getModulesForProcess(processInfo.processName, processInfo.uid);
     }

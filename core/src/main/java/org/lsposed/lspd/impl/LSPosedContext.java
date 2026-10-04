@@ -381,8 +381,14 @@ public class LSPosedContext implements XposedInterface {
 
         // Close registration before the handle list is read: a hook old code registered from here
         // on would survive the swap and hold the retired classloader in place through its hooker.
-        previous.context.freeze();
-        var oldHandles = LSPosedBridge.HookRegistry.liveHandles(packageName);
+        // The registry lock is what a registration holds while it is under way, so taking it here
+        // makes a registration either finish before the freeze (and be in the list) or re-check
+        // the frozen flag under the same lock in doHook and give up.
+        List<XposedInterface.HookHandle> oldHandles;
+        synchronized (LSPosedBridge.HookRegistry.lockOf(packageName)) {
+            previous.context.freeze();
+            oldHandles = LSPosedBridge.HookRegistry.liveHandles(packageName);
+        }
 
         var swapped = false;
         try {
@@ -422,8 +428,12 @@ public class LSPosedContext implements XposedInterface {
             return ILSPApplicationService.HOT_RELOAD_FAILED;
         } finally {
             // A reload that did not go through leaves the old code in charge, so it gets its
-            // registration back; a completed one stays retired for good.
-            if (!swapped) previous.context.unfreeze();
+            // registration back; a completed one stays retired for good. Take the registry lock
+            // around the unfreeze, so a registration cannot observe a stale frozen flag from a
+            // reload that has already failed.
+            synchronized (LSPosedBridge.HookRegistry.lockOf(packageName)) {
+                if (!swapped) previous.context.unfreeze();
+            }
         }
     }
 
