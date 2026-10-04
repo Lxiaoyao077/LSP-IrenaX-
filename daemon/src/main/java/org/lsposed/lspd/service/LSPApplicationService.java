@@ -370,13 +370,9 @@ public class LSPApplicationService extends ILSPApplicationService.Stub {
             return ConfigManager.getInstance().getModulesForSystemServer();
         }
         // The manager is never handed modules, so it is never in a reload scope either - the same
-        // answer the module list gives it.
-        try {
-            if (ServiceManager.getManagerService().isRunningManager(processInfo.pid, processInfo.uid))
-                return Collections.emptyList();
-        } catch (RemoteException e) {
-            Log.w(TAG, "Cannot check whether " + processInfo.processName + " is the manager", e);
-        }
+        // answer the module list gives it. isRunningManager does not throw.
+        if (ServiceManager.getManagerService().isRunningManager(processInfo.pid, processInfo.uid))
+            return Collections.emptyList();
         return ConfigManager.getInstance().getModulesForProcess(processInfo.processName, processInfo.uid);
     }
 
