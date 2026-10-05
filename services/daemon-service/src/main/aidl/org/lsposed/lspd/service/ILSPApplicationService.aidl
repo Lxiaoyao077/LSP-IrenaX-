@@ -4,7 +4,7 @@ import org.lsposed.lspd.models.Module;
 
 interface ILSPApplicationService {
     /**
-     * The code a process's hot reload endpoint answers to (API 102), carrying the module package
+     * The code a process' hot reload endpoint answers to (API 102), carrying the module package
      * name and the extras to pass along.
      */
     const int HOT_RELOAD_TRANSACTION_CODE = 1598575180;

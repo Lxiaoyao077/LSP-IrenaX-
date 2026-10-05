@@ -259,6 +259,7 @@ public class LSPNotificationManager {
     private static final int SCOPE_CALLBACK_V100_DENIED_TRANSACTION = 4;
     private static final int SCOPE_CALLBACK_V100_TIMEOUT_TRANSACTION = 5;
     private static final int SCOPE_CALLBACK_V100_FAILED_TRANSACTION = 6;
+
     static void notifyScopeRequestApproved(IXposedScopeCallback callback, boolean api101, String scopePackageName) throws RemoteException {
         var data = Parcel.obtain();
         try {

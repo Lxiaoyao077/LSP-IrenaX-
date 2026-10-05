@@ -46,7 +46,7 @@ public class XposedInterfaceWrapper implements XposedInterface {
     /**
      * Attaches the framework interface to the module. Modules should never call this method.
      *
-     * @param base       The framework interface
+     * @param base The framework interface
      * @param detachImpl What {@link #detach()} runs, supplied by the framework
      */
     @SuppressWarnings("unused")

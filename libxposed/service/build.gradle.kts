@@ -22,8 +22,5 @@ android {
 
 dependencies {
     compileOnly(libs.androidx.annotation)
-    // The submodule sources carry the upstream API 102 RFC, annotated with
-    // @SinceApi from io.github.libxposed:annotation - the same compileOnly
-    // dependency the upstream service project itself declares.
     compileOnly("io.github.libxposed:annotation:1.0.0")
 }
